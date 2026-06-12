@@ -1,0 +1,4 @@
+# Pin the GNU toolchain so building needs no Visual Studio / MSVC install:
+# rustup's windows-gnu toolchain bundles its own linker.
+[toolchain]
+channel = "stable-x86_64-pc-windows-gnu"
