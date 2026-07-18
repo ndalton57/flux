@@ -33,6 +33,7 @@ fn main() {
         Some("ls") | Some("list") => cmd_ls(),
         Some("detach") | Some("d") => cmd_signal(arg(1), C_DETACH_ALL),
         Some("kill") => cmd_signal(arg(1), C_KILL),
+        Some("autostart") => cmd_autostart(arg(1)),
         Some("help") | Some("-h") | Some("--help") => {
             print!("{}", HELP);
             0
@@ -52,7 +53,9 @@ fn check_name(name: &str) -> Option<i32> {
     if valid_name(name) {
         None
     } else {
-        eprintln!("fx: invalid session name '{name}' (use letters, digits, '-', '_'; max 32)");
+        eprintln!(
+            "[flux] invalid session name '{name}' (use letters, digits, '-', '_', '.'; max 32)"
+        );
         Some(1)
     }
 }
@@ -61,7 +64,7 @@ fn check_name(name: &str) -> Option<i32> {
 /// needed (the same attach-or-create that bare `fx` does for 'main').
 fn cmd_session(name: &str, rest: &[String]) -> i32 {
     if !valid_name(name) {
-        eprintln!("fx: unknown command or invalid session name '{name}'\n");
+        eprintln!("[flux] unknown command or invalid session name '{name}'\n");
         print!("{}", HELP);
         return 1;
     }
@@ -75,13 +78,13 @@ fn cmd_session(name: &str, rest: &[String]) -> i32 {
                 // Everything after -- is the shell command line for this session.
                 let cmd: Vec<&str> = it.by_ref().map(String::as_str).collect();
                 if cmd.is_empty() {
-                    eprintln!("fx: expected a command after --");
+                    eprintln!("[flux] expected a command after --");
                     return 1;
                 }
                 shell = Some(cmd.join(" "));
             }
             s => {
-                eprintln!("fx: unexpected argument '{s}'");
+                eprintln!("[flux] unexpected argument '{s}'");
                 return 1;
             }
         }
@@ -95,14 +98,14 @@ fn cmd_session(name: &str, rest: &[String]) -> i32 {
         return 0;
     }
     if let Err(e) = client::spawn_server(name, shell.as_deref()) {
-        eprintln!("fx: failed to start session: {e}");
+        eprintln!("[flux] failed to start session: {e}");
         return 1;
     }
     // Wait until the pipe is up so callers can rely on it.
     let sid = match user_sid_string() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("fx: {e}");
+            eprintln!("[flux] {e}");
             return 1;
         }
     };
@@ -115,7 +118,7 @@ fn cmd_session(name: &str, rest: &[String]) -> i32 {
             return 0;
         }
     }
-    eprintln!("fx: server did not start (see %LOCALAPPDATA%\\flux\\ logs)");
+    eprintln!("[flux] server did not start (see %LOCALAPPDATA%\\flux\\ logs)");
     1
 }
 
@@ -136,7 +139,7 @@ fn cmd_pty(rest: &[String]) -> i32 {
         })
         .collect();
     if cmd.is_empty() {
-        eprintln!("fx: __pty needs a command");
+        eprintln!("[flux] __pty needs a command");
         return 1;
     }
 
@@ -154,7 +157,7 @@ fn cmd_pty(rest: &[String]) -> i32 {
     let pty = match conpty::spawn(&cmd.join(" "), cols.max(2), rows.max(2)) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("fx: __pty spawn failed: {e}");
+            eprintln!("[flux] __pty spawn failed: {e}");
             return 1;
         }
     };
@@ -200,6 +203,59 @@ fn cmd_pty(rest: &[String]) -> i32 {
     0
 }
 
+/// `fx autostart [name]` — register a Task Scheduler startup task that
+/// runs `fx <name> -d` at boot as the current user with the LIMITED
+/// (non-elevated) token. Uses an S4U principal, so no password is stored or
+/// asked for (works for PIN-only accounts); the trade-off is that the
+/// boot-created session's token carries no network credentials — sessions
+/// needing credentialed shares should be created from an ssh/RDP logon
+/// instead. Needs an elevated shell.
+fn cmd_autostart(name: Option<&str>) -> i32 {
+    let name = name.unwrap_or(DEFAULT_SESSION);
+    if let Some(c) = check_name(name) {
+        return c;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(e) => {
+            eprintln!("[flux] {e}");
+            return 1;
+        }
+    };
+    let exe_ps = exe.replace('\'', "''");
+    let script = format!(
+        "$existing = Get-ScheduledTask -TaskName 'flux {name} session' -ErrorAction SilentlyContinue; \
+         if ($existing) {{ Write-Host \"[flux] boot task for '{name}' already exists - updating it\" }}; \
+         $u = \"$env:COMPUTERNAME\\$env:USERNAME\"; \
+         try {{ \
+             Register-ScheduledTask -TaskName 'flux {name} session' \
+               -Action (New-ScheduledTaskAction -Execute '{exe_ps}' -Argument '{name} -d') \
+               -Trigger (New-ScheduledTaskTrigger -AtStartup) \
+               -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)) \
+               -Principal (New-ScheduledTaskPrincipal -UserId $u -LogonType S4U -RunLevel Limited) \
+               -Force -ErrorAction Stop | Out-Null; \
+             $verb = if ($existing) {{ 'updated' }} else {{ 'registered' }}; \
+             Write-Host \"[flux] boot task ${{verb}}: '{name}' will be running (non-elevated) after every restart\"; \
+             Write-Host \"[flux] remove with: Unregister-ScheduledTask 'flux {name} session'\" \
+         }} catch {{ \
+             Write-Host \"[flux] $($_.Exception.Message.Trim())\"; \
+             Write-Host '[flux] registering a boot task needs an elevated (administrator) shell'; \
+             exit 1 \
+         }}"
+    );
+    match std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .status()
+    {
+        Ok(s) if s.success() => 0,
+        Ok(_) => 1,
+        Err(e) => {
+            eprintln!("[flux] cannot run powershell: {e}");
+            1
+        }
+    }
+}
+
 fn session_exists(name: &str) -> bool {
     if let Ok(sid) = user_sid_string() {
         if let Ok(h) = open_pipe(&pipe_path(&sid, name)) {
@@ -211,22 +267,10 @@ fn session_exists(name: &str) -> bool {
 }
 
 fn list_session_names() -> Vec<String> {
-    let mut names = Vec::new();
-    if let Ok(sid) = user_sid_string() {
-        let prefix = pipe_prefix(&sid);
-        if let Ok(rd) = std::fs::read_dir(r"\\.\pipe\") {
-            for e in rd.flatten() {
-                let n = e.file_name().to_string_lossy().into_owned();
-                if let Some(rest) = n.strip_prefix(&prefix) {
-                    if valid_name(rest) {
-                        names.push(rest.to_string());
-                    }
-                }
-            }
-        }
+    match user_sid_string() {
+        Ok(sid) => list_sessions(&sid),
+        Err(_) => Vec::new(),
     }
-    names.sort();
-    names
 }
 
 fn query_info(name: &str) -> Option<(String, String, String)> {
@@ -256,13 +300,31 @@ fn cmd_ls() -> i32 {
         println!("no sessions");
         return 0;
     }
+    // Highlight the session we're inside (running `fx ls` in a session means
+    // a ConPTY console, so VT color is safe; skip it when output is not a
+    // console, e.g. piped).
+    let current = std::env::var("FLUX_SESSION").ok();
+    let is_console = {
+        let mut m = 0u32;
+        unsafe {
+            windows_sys::Win32::System::Console::GetConsoleMode(
+                std_handle(STD_OUTPUT_HANDLE),
+                &mut m,
+            ) != 0
+        }
+    };
     println!("{:<20} {:>8} {:>8}  STARTED", "NAME", "PID", "CLIENTS");
     for n in names {
+        let name_col = if is_console && current.as_deref() == Some(n.as_str()) {
+            format!("\x1b[32m{n:<20}\x1b[0m")
+        } else {
+            format!("{n:<20}")
+        };
         match query_info(&n) {
             Some((pid, clients, started)) => {
-                println!("{:<20} {:>8} {:>8}  {}", n, pid, clients, started)
+                println!("{name_col} {pid:>8} {clients:>8}  {started}")
             }
-            None => println!("{:<20} {:>8} {:>8}", n, "-", "-"),
+            None => println!("{name_col} {:>8} {:>8}", "-", "-"),
         }
     }
     0
@@ -274,7 +336,7 @@ fn cmd_signal(name: Option<&str>, ty: u8) -> i32 {
     let name = match name.or(env_name.as_deref()) {
         Some(n) => n.to_string(),
         None => {
-            eprintln!("fx: not inside a flux session — specify a name (see `fx ls`)");
+            eprintln!("[flux] not inside a flux session — specify a name (see `fx ls`)");
             return 1;
         }
     };
@@ -284,14 +346,14 @@ fn cmd_signal(name: Option<&str>, ty: u8) -> i32 {
     let sid = match user_sid_string() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("fx: {e}");
+            eprintln!("[flux] {e}");
             return 1;
         }
     };
     let h = match open_pipe(&pipe_path(&sid, &name)) {
         Ok(h) => h,
         Err(_) => {
-            eprintln!("fx: no session '{name}'");
+            eprintln!("[flux] no session '{name}'");
             return 1;
         }
     };
@@ -303,7 +365,7 @@ fn cmd_signal(name: Option<&str>, ty: u8) -> i32 {
     }
     close_handle(h);
     if !ok {
-        eprintln!("fx: could not signal session '{name}'");
+        eprintln!("[flux] could not signal session '{name}'");
         return 1;
     }
     match ty {
@@ -322,10 +384,13 @@ usage:
   fx <name> -d        start a session without attaching
   fx <name> -- <cmd>  run <cmd> in the session instead of the default shell
   fx attach [name]    attach only; fail if it doesn't exist   (alias: a)
-  fx ls               list your sessions                      (alias: list)
+  fx list             list your sessions; current one green   (alias: ls)
   fx detach [name]    detach all attached clients             (alias: d)
   fx kill [name]      end a session (terminates its shell)
+  fx autostart        start 'main' at every boot, non-elevated
+                      (one-time setup from an elevated shell)
   fx --version        print the flux version
+  fx --help           show this help
 
 inside a session, `fx <name>` switches the attached client(s) over to that
 session in place (creating it if needed) — no nesting. For detach/kill,
@@ -333,11 +398,13 @@ session in place (creating it if needed) — no nesting. For detach/kill,
 
 keys:
   Ctrl+\\              detach from the current session
-                      (Ctrl+Shift+\\ also works on full-fidelity input)
+  Ctrl+]              cycle to the next session
+  Ctrl+[              cycle to the previous session (local input; over ssh
+                      it is identical to Esc — use Ctrl+] to wrap around)
+  Ctrl+~              open the new-session prompt
+                      (Ctrl+6 works from every terminal)
 
 environment:
   FLUX_SHELL          default shell command line for new sessions
-                      (otherwise sessions run the shell fx was launched
-                      from — cmd, powershell, pwsh, bash, nu — falling
-                      back to powershell.exe)
+                      (otherwise the shell fx was launched from)
 ";

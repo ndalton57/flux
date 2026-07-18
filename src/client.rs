@@ -44,6 +44,20 @@ const CTRL_PRESSED: u32 = 0x0008 | 0x0004; // left | right
 const ALT_PRESSED: u32 = 0x0001 | 0x0002; // right | left
 const FS_CHAR: u16 = 0x1C; // the control char Ctrl+\ produces
 
+// Session-cycling keys: Ctrl+] (next) survives every transport as the bare
+// GS control char. Ctrl+[ (previous) is byte-identical to Esc on VT
+// transports, so it is only recognized from full-fidelity local records.
+const VK_OEM_6: u16 = 0xDD; // ']' key on US layouts
+const VK_OEM_4: u16 = 0xDB; // '[' key on US layouts
+const GS_CHAR: u16 = 0x1D; // the control char Ctrl+] produces
+
+// New-session key: Ctrl+` / Ctrl+~ / Ctrl+^ / Ctrl+6 all collapse to the
+// RS control char under the ASCII ctrl-chord rule; Ctrl+6 is the spelling
+// every terminal transmits.
+const VK_OEM_3: u16 = 0xC0; // '`' key on US layouts
+const VK_6: u16 = 0x36;
+const RS_CHAR: u16 = 0x1E; // the control char those chords produce
+
 const CTRL_C_EVENT: u32 = 0;
 const CTRL_BREAK_EVENT: u32 = 1;
 
@@ -62,6 +76,10 @@ static IN_CP: AtomicU32 = AtomicU32::new(0);
 static OUT_CP: AtomicU32 = AtomicU32::new(0);
 /// Set when the user detaches locally, so the reader thread exits quietly.
 static DETACHING: AtomicBool = AtomicBool::new(false);
+/// Set while the new-session name prompt is on screen; the reader drops
+/// session output so the dialog isn't painted over (the screen is restored
+/// afterward by the switch/reconnect replay).
+static PROMPT_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// The pipe of the session this client is currently attached to. Swapped in
 /// place when the server tells us to switch sessions; also used by the
 /// console ctrl handler thread.
@@ -71,6 +89,9 @@ static CURRENT_NAME: Mutex<String> = Mutex::new(String::new());
 /// Serializes client->server writes (input loop, ctrl handler, switcher) so
 /// frames never interleave and nobody writes to a just-closed pipe.
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
+/// Serializes writes to this console (reader output vs. status banners from
+/// the input thread during a key-triggered session switch).
+static OUT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Send a frame to the currently attached session. The pipe is resolved
 /// under the write lock so a concurrent session switch can't close it
@@ -215,9 +236,7 @@ fn enter_raw() -> io::Result<()> {
         let hout = std_handle(STD_OUTPUT_HANDLE);
         let (mut im, mut om) = (0u32, 0u32);
         if GetConsoleMode(hin, &mut im) == 0 || GetConsoleMode(hout, &mut om) == 0 {
-            return Err(io::Error::other(
-                "fx must run in a console (interactive terminal)",
-            ));
+            return Err(io::Error::other("attaching needs an interactive console"));
         }
         IN_MODE.store(im, Ordering::SeqCst);
         OUT_MODE.store(om, Ordering::SeqCst);
@@ -253,8 +272,10 @@ fn restore_console() {
     }
     unsafe {
         let hout = std_handle(STD_OUTPUT_HANDLE);
-        // Undo any lingering colors/hidden cursor from the session.
-        let _ = write_all(hout, b"\x1b[0m\x1b[?25h");
+        // Undo any lingering colors/hidden cursor from the session, then
+        // clear the visible screen so session text doesn't linger in the
+        // outer shell (scrollback is deliberately left intact).
+        let _ = write_all(hout, b"\x1b[0m\x1b[?25h\x1b[2J\x1b[H");
         SetConsoleMode(std_handle(STD_INPUT_HANDLE), IN_MODE.load(Ordering::SeqCst));
         SetConsoleMode(hout, OUT_MODE.load(Ordering::SeqCst));
         SetConsoleCP(IN_CP.load(Ordering::SeqCst));
@@ -263,6 +284,7 @@ fn restore_console() {
 }
 
 fn say(msg: &str) {
+    let _g = OUT_LOCK.lock().unwrap();
     let _ = write_all(std_handle(STD_OUTPUT_HANDLE), msg.as_bytes());
 }
 
@@ -409,18 +431,17 @@ pub fn attach(name: &str, create: bool, shell: Option<&str>) -> i32 {
     let pipe = match connect(name, create, shell) {
         Ok(h) => h,
         Err(e) if e.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) => {
-            eprintln!("fx: no session '{name}' (use `fx {name}` to create it, or `fx ls`)");
+            eprintln!("[flux] no session '{name}' (use `fx {name}` to create it, or `fx ls`)");
             return 1;
         }
         Err(e) => {
-            eprintln!("fx: cannot attach to '{name}': {e}");
+            eprintln!("[flux] cannot attach to '{name}': {e}");
             return 1;
         }
     };
 
-    println!("[flux] attached to '{name}' — Ctrl+\\ detaches, 'exit' ends the session");
     if let Err(e) = enter_raw() {
-        eprintln!("fx: {e}");
+        eprintln!("[flux] {e}");
         close_handle(pipe);
         return 1;
     }
@@ -435,7 +456,7 @@ pub fn attach(name: &str, create: bool, shell: Option<&str>) -> i32 {
     let (cols, rows) = console_size();
     if send_current(C_RESIZE, &resize_payload(cols, rows)).is_err() {
         restore_console();
-        eprintln!("fx: connection failed");
+        eprintln!("[flux] connection failed");
         return 1;
     }
 
@@ -446,7 +467,7 @@ pub fn attach(name: &str, create: bool, shell: Option<&str>) -> i32 {
     restore_console();
     if code == 0 {
         let last = CURRENT_NAME.lock().unwrap().clone();
-        println!("\n[flux] detached from '{last}' — reattach with: fx {last}");
+        println!("[flux] detached from '{last}' — reattach with: fx {last}");
     }
     code
 }
@@ -463,41 +484,52 @@ fn reader_loop(rpipe: H) {
     loop {
         match read_frame(rpipe.raw()) {
             Ok((S_OUTPUT, p)) => {
+                if PROMPT_ACTIVE.load(Ordering::SeqCst) {
+                    continue; // muted while the name prompt is on screen
+                }
+                let _g = OUT_LOCK.lock().unwrap();
                 let _ = write_all(hout, &p);
             }
             Ok((S_EXIT, _)) => {
                 restore_console();
-                say("\r\n[flux] session ended.\r\n");
+                say("[flux] session ended.\r\n");
                 unsafe { ExitProcess(0) };
             }
             Ok((S_DETACHED, _)) => {
                 restore_console();
-                say("\r\n[flux] detached.\r\n");
+                say("[flux] detached.\r\n");
                 unsafe { ExitProcess(0) };
             }
             Ok((S_SWITCH, p)) => {
                 if let Ok(target) = String::from_utf8(p) {
-                    if valid_name(&target) && do_switch(rpipe, &target) {
+                    if valid_name(&target) && switch_to(&target) {
                         return; // a new reader owns the new pipe now
                     }
                 }
             }
             Ok(_) => {}
             Err(_) => {
-                if DETACHING.load(Ordering::SeqCst) {
-                    return; // local detach in progress; main thread reports
+                // Quiet exit when this reader was superseded: a local detach
+                // or a session switch (from any thread) closed our pipe.
+                if DETACHING.load(Ordering::SeqCst)
+                    || CURRENT_PIPE.load(Ordering::SeqCst) != rpipe.raw() as usize
+                {
+                    return;
                 }
                 restore_console();
-                say("\r\n[flux] connection lost.\r\n");
+                say("[flux] connection lost.\r\n");
                 unsafe { ExitProcess(1) };
             }
         }
     }
 }
 
-/// Swap this client from `old` to the session `target` in place: same
-/// console, same raw mode — the new session's replay repaints the screen.
-fn do_switch(old: H, target: &str) -> bool {
+/// Swap this client to the session `target` in place: same console, same
+/// raw mode — the new session's replay repaints the screen (silently: any
+/// banner here would be wiped by the repaint within milliseconds anyway).
+/// Safe to call from any thread; the reader on the old pipe notices it was
+/// superseded and exits quietly.
+fn switch_to(target: &str) -> bool {
     let sid = match user_sid_string() {
         Ok(s) => s,
         Err(_) => return false,
@@ -521,13 +553,196 @@ fn do_switch(old: H, target: &str) -> bool {
         // Swap under the write lock so in-flight keystrokes either land on
         // the old session or the new one, never on a closed handle.
         let _g = WRITE_LOCK.lock().unwrap();
-        CURRENT_PIPE.store(new as usize, Ordering::SeqCst);
-        close_handle(old.raw());
+        let old = CURRENT_PIPE.swap(new as usize, Ordering::SeqCst) as HANDLE;
+        if !old.is_null() {
+            close_handle(old);
+        }
     }
     *CURRENT_NAME.lock().unwrap() = target.to_string();
-    say(&format!("\r\n[flux] \u{2192} session '{target}'\r\n"));
     spawn_reader(H(new));
     true
+}
+
+/// Ctrl+] / Ctrl+[ hop to the neighboring session (sorted order, wrapping)
+/// without detaching — for when the current session is busy and can't take
+/// an `fx <name>` command. No-op with a single session. AltGr chords are
+/// excluded so layouts that type brackets via AltGr are unaffected.
+fn cycle_direction(k: &KEY_EVENT_RECORD) -> Option<bool> {
+    let uc = unsafe { k.uChar.UnicodeChar };
+    let cs = k.dwControlKeyState;
+    let ctrl_only = cs & CTRL_PRESSED != 0 && cs & ALT_PRESSED == 0;
+    if uc == GS_CHAR || (ctrl_only && k.wVirtualKeyCode == VK_OEM_6) {
+        return Some(true);
+    }
+    if ctrl_only && k.wVirtualKeyCode == VK_OEM_4 {
+        return Some(false);
+    }
+    None
+}
+
+/// Ctrl+` (or Ctrl+6 etc.) — create a fresh auto-named session and switch
+/// to it. The escape hatch when every existing session is busy or hung.
+fn is_new_session_key(k: &KEY_EVENT_RECORD) -> bool {
+    let uc = unsafe { k.uChar.UnicodeChar };
+    let cs = k.dwControlKeyState;
+    let ctrl_only = cs & CTRL_PRESSED != 0 && cs & ALT_PRESSED == 0;
+    uc == RS_CHAR || (ctrl_only && (k.wVirtualKeyCode == VK_OEM_3 || k.wVirtualKeyCode == VK_6))
+}
+
+/// Draw (or update) the centered name-prompt dialog. `full` redraws the
+/// whole box; otherwise only the input row and cursor are refreshed.
+fn draw_prompt(name: &str, full: bool) {
+    const INNER: usize = 36;
+    let (c, r) = console_size();
+    let (cols, rows) = (c as usize, r as usize);
+    let hout = std_handle(STD_OUTPUT_HANDLE);
+    let _g = OUT_LOCK.lock().unwrap();
+    let mut out = String::new();
+    if cols < INNER + 2 || rows < 7 {
+        // Window too small for the dialog: plain fallback.
+        out.push_str("\x1b[0m\x1b[2J\x1b[H\x1b[?25hNew session name: ");
+        out.push_str(name);
+        let _ = write_all(hout, out.as_bytes());
+        return;
+    }
+    let left = (cols - (INNER + 2)) / 2;
+    let top = (rows - 7) / 2;
+    let center = |s: &str| {
+        let pad = (INNER - s.chars().count()) / 2;
+        format!(
+            "{}{}{}",
+            " ".repeat(pad),
+            s,
+            " ".repeat(INNER - s.chars().count() - pad)
+        )
+    };
+    let go = |row: usize| format!("\x1b[{};{}H", top + row, left + 1);
+    if full {
+        out.push_str("\x1b[0m\x1b[2J\x1b[?25h");
+        out.push_str(&go(1));
+        out.push_str(&format!("\u{250C}{}\u{2510}", "\u{2500}".repeat(INNER)));
+        out.push_str(&go(2));
+        out.push_str(&format!("\u{2502}{}\u{2502}", center("New session name:")));
+        out.push_str(&go(3));
+        out.push_str(&format!("\u{2502}{}\u{2502}", " ".repeat(INNER)));
+        out.push_str(&go(5));
+        out.push_str(&format!("\u{2502}{}\u{2502}", " ".repeat(INNER)));
+        out.push_str(&go(6));
+        out.push_str(&format!(
+            "\u{2502}\x1b[38;5;240m{}\x1b[0m\u{2502}",
+            center("Enter create \u{00B7} Esc cancel")
+        ));
+        out.push_str(&go(7));
+        out.push_str(&format!("\u{2514}{}\u{2518}", "\u{2500}".repeat(INNER)));
+    }
+    out.push_str(&go(4));
+    out.push_str(&format!("\u{2502}{}\u{2502}", center(name)));
+    // Park the (visible, blinking) cursor right after the typed text.
+    let pad = (INNER - name.chars().count()) / 2;
+    out.push_str(&format!(
+        "\x1b[{};{}H",
+        top + 4,
+        left + 2 + pad + name.chars().count()
+    ));
+    let _ = write_all(hout, out.as_bytes());
+}
+
+/// Modal key loop for the name prompt. Enter on a non-empty name confirms;
+/// Esc / Ctrl+C / Ctrl+` cancel; only session-name characters are accepted
+/// (no spaces, tabs, or newlines — same rules as `fx <name>`).
+fn run_name_prompt() -> Option<String> {
+    let hin = std_handle(STD_INPUT_HANDLE);
+    let mut name = String::new();
+    draw_prompt(&name, true);
+    let mut records: [INPUT_RECORD; 32] = unsafe { zeroed() };
+    loop {
+        let mut n: u32 = 0;
+        if unsafe { ReadConsoleInputW(hin, records.as_mut_ptr(), 32, &mut n) } == 0 {
+            return None;
+        }
+        for rec in records.iter().take(n as usize) {
+            match rec.EventType {
+                EV_KEY => {
+                    let k = unsafe { rec.Event.KeyEvent };
+                    if k.bKeyDown == 0 {
+                        continue;
+                    }
+                    let uc = unsafe { k.uChar.UnicodeChar };
+                    let repeat = k.wRepeatCount.max(1) as usize;
+                    if uc == 0x0D {
+                        if !name.is_empty() {
+                            return Some(name); // blank entries not allowed
+                        }
+                    } else if uc == 0x1B
+                        || k.wVirtualKeyCode == 0x1B
+                        || is_ctrl_c(&k)
+                        || is_new_session_key(&k)
+                    {
+                        return None;
+                    } else if k.wVirtualKeyCode == 0x08 {
+                        for _ in 0..repeat {
+                            name.pop();
+                        }
+                        draw_prompt(&name, false);
+                    } else if let Some(c) = char::from_u32(uc as u32) {
+                        if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                            for _ in 0..repeat {
+                                if name.len() < 32 {
+                                    name.push(c);
+                                }
+                            }
+                            draw_prompt(&name, false);
+                        }
+                    }
+                }
+                EV_WINDOW_BUFFER_SIZE => draw_prompt(&name, true),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Ctrl+`: full-screen prompt for a new session name, then create + switch.
+/// Cancelling (or naming the current session) reconnects to the current
+/// session, which repaints the screen from the replay buffer.
+fn prompt_new_session() {
+    PROMPT_ACTIVE.store(true, Ordering::SeqCst);
+    let choice = run_name_prompt();
+    PROMPT_ACTIVE.store(false, Ordering::SeqCst);
+    let current = CURRENT_NAME.lock().unwrap().clone();
+    match choice {
+        Some(name) if name != current => {
+            if ensure_session(&name, None).is_ok() {
+                switch_to(&name);
+            } else {
+                say("\r\n[flux] could not create session\r\n");
+                switch_to(&current);
+            }
+        }
+        _ => {
+            switch_to(&current);
+        }
+    }
+}
+
+fn cycle_session(forward: bool) {
+    let sid = match user_sid_string() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let names = list_sessions(&sid);
+    if names.len() < 2 {
+        return;
+    }
+    let current = CURRENT_NAME.lock().unwrap().clone();
+    let target = match names.iter().position(|n| *n == current) {
+        Some(i) if forward => names[(i + 1) % names.len()].clone(),
+        Some(i) => names[(i + names.len() - 1) % names.len()].clone(),
+        None => names[0].clone(),
+    };
+    if target != current {
+        switch_to(&target);
+    }
 }
 
 /// Ensure a session exists, spawning its server if needed and waiting for
@@ -563,33 +778,33 @@ fn request_switch(current: &str, target: &str, create: bool, shell: Option<&str>
     let sid = match user_sid_string() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("fx: {e}");
+            eprintln!("[flux] {e}");
             return 1;
         }
     };
     if create {
         if let Err(e) = ensure_session(target, shell) {
-            eprintln!("fx: cannot start session '{target}': {e}");
+            eprintln!("[flux] cannot start session '{target}': {e}");
             return 1;
         }
     } else if open_pipe(&pipe_path(&sid, target))
         .map(close_handle)
         .is_err()
     {
-        eprintln!("fx: no session '{target}' (use `fx {target}` to create it)");
+        eprintln!("[flux] no session '{target}' (use `fx {target}` to create it)");
         return 1;
     }
     let h = match open_pipe(&pipe_path(&sid, current)) {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("fx: cannot reach current session '{current}': {e}");
+            eprintln!("[flux] cannot reach current session '{current}': {e}");
             return 1;
         }
     };
     let ok = write_frame(h, C_SWITCH, target.as_bytes()).is_ok();
     close_handle(h);
     if !ok {
-        eprintln!("fx: switch request failed");
+        eprintln!("[flux] switch request failed");
         return 1;
     }
     println!("[flux] switching to '{target}'");
@@ -711,6 +926,26 @@ fn input_loop(initial: (i16, i16)) -> i32 {
                                 bytes.clear();
                             }
                             let _ = send_current(C_SIGNAL, &[0]);
+                        }
+                        continue; // swallow both edges of the chord
+                    }
+                    if let Some(forward) = cycle_direction(&k) {
+                        if k.bKeyDown != 0 {
+                            if !bytes.is_empty() {
+                                let _ = send_current(C_STDIN, &bytes);
+                                bytes.clear();
+                            }
+                            cycle_session(forward);
+                        }
+                        continue; // swallow both edges of the chord
+                    }
+                    if is_new_session_key(&k) {
+                        if k.bKeyDown != 0 {
+                            if !bytes.is_empty() {
+                                let _ = send_current(C_STDIN, &bytes);
+                                bytes.clear();
+                            }
+                            prompt_new_session();
                         }
                         continue; // swallow both edges of the chord
                     }

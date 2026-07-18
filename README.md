@@ -9,17 +9,23 @@ fx [name]           attach to session 'name', creating it if needed
                     (default session: 'main')
 fx <name> -d        start a session without attaching
 fx <name> -- <cmd>  run <cmd> in the session instead of the default shell
-fx attach [name]    attach only; fail if it doesn't exist   (alias: a)
-fx ls               list your sessions                      (alias: list)
-fx detach [name]    detach all attached clients             (alias: d)
+fx attach [name]    attach only; fail if it doesn't exist           (alias: a)
+fx list               list your sessions; current session is green  (alias: ls)
+fx detach [name]    detach all attached clients                     (alias: d)
 fx kill [name]      end a session (terminates its shell)
+fx autostart        start 'main' at every boot (one-time setup, requires elevated shell)
+
 fx --version        print the flux version
+fx --help           displays help page
 ```
 
 - **`Ctrl+\` detaches** from the current session (`Ctrl+Shift+\` works too).
   Typing `exit` in the shell ends the session for real. Plain VT transports
   like SSH can't carry the Shift distinction for that key, which is why both
   count.
+- **`Ctrl+]`** while inside a session cycles to the next session
+- **`Ctrl+[`** while inside a session cycles to the previous session
+- **`Ctrl+~`** while inside a session opens up the new session modal 
 - Inside a session, `fx detach` and `fx kill` know their own session via the
   `FLUX_SESSION` environment variable, so the name is optional.
 - Any first argument that isn't a known command is treated as a session name:

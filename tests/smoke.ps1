@@ -20,6 +20,10 @@ $out = & $Exe $name -d
 Check ($LASTEXITCODE -eq 0) "fx $name -d (create detached)"
 $out = & $Exe $name -d
 Check ($LASTEXITCODE -eq 0 -and "$out" -match 'already running') "fx <name> -d is idempotent"
+$dotname = "dot.name.$PID"
+$out = & $Exe $dotname -d
+Check ($LASTEXITCODE -eq 0) "session names may contain periods"
+& $Exe kill $dotname | Out-Null
 
 # --- 2. it shows up in ls ---------------------------------------------------
 $ls = (& $Exe ls) -join "`n"
@@ -179,8 +183,9 @@ $r = New-RawReader $ip.StandardOutput.BaseStream
 function Send-Raw([byte[]]$b) { $rin.Write($b, 0, $b.Length); $rin.Flush() }
 function Send-Str([string]$s) { Send-Raw ([Text.Encoding]::UTF8.GetBytes($s)) }
 
-Check (Wait-Output $r 'attached to' 10) "interactive client attached"
+# No attach banner anymore: liveness = session output starts flowing.
 Wait-RawQuiet $r 2000 30000    # let the shell reach its prompt
+Check ($r.Out.Length -gt 200) "interactive client attached (session output flowing)"
 
 # Ctrl+C must interrupt a running command: a follow-up command can only
 # execute within the window if the 30s sleep was actually aborted.
@@ -238,13 +243,63 @@ Check (-not ($r.Out.ToString().Substring($mark) -match ';\d+;\d+_')) "no key-seq
 
 # Switching: `fx <other>` typed INSIDE a session must swap this client over
 # to the other session in place (no nesting, no stacked attachments).
+# Switching is silent, so verify via the CLIENTS column.
+function Get-Clients([string]$SessName) {
+    $rows = (& $Exe ls) -join "`n"
+    if ($rows -match "(?m)^$([regex]::Escape($SessName))\s+\d+\s+(\d+)\s") { return [int]$Matches[1] }
+    return -1
+}
 $swname = "swtest$PID"
 Wait-RawQuiet $r 800 5000
 Send-Str "& '$Exe' $swname`r"
-Check (Wait-Output $r "session '$swname'" 25) "client switched to '$swname' in place"
+$deadline = [DateTime]::UtcNow.AddSeconds(25)
+while ((Get-Clients $swname) -ne 1 -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 300 }
+Check ((Get-Clients $swname) -eq 1) "fx <name> in-session switches the client to '$swname'"
 Wait-RawQuiet $r 2500 30000      # let the switched-to shell reach its prompt
 Send-Str "echo sw-marker-$PID`r"
 Check (Wait-Output $r "sw-marker-$PID" 10) "input lands in the switched-to session"
+
+# Cycle keys: Ctrl+] hops to a neighboring session, Ctrl+[ hops back.
+# Verified via the CLIENTS column: our one client leaves swtest (count 0)
+# and returns (count 1). Which neighbor it visits doesn't matter — the
+# user may have real sessions running.
+Wait-RawQuiet $r 800 5000
+Send-Raw (, [byte]0x1D)
+$deadline = [DateTime]::UtcNow.AddSeconds(10)
+while ((Get-Clients $swname) -ne 0 -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 300 }
+Check ((Get-Clients $swname) -eq 0) "Ctrl+] (raw VT byte) cycles to the next session"
+Start-Sleep -Milliseconds 800
+Send-Str "$([char]27)[219;26;27;1;8;1_$([char]27)[219;26;27;0;8;1_"
+$deadline = [DateTime]::UtcNow.AddSeconds(10)
+while ((Get-Clients $swname) -ne 1 -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 300 }
+Check ((Get-Clients $swname) -eq 1) "Ctrl+[ (local chord) cycles back to the previous session"
+Wait-RawQuiet $r 1500 15000
+
+# Ctrl+` (raw RS byte) opens the name prompt; a blank Enter is ignored,
+# then a typed name + Enter creates that session and switches to it
+# silently (no banner). Prove the switch by running a marker command that
+# must land in the NEW session's buffer (verified at the end via its pipe).
+Send-Raw (, [byte]0x1E)
+Send-Str "`r"                # blank entry must be ignored
+Send-Str "kbsess$PID`r"
+$deadline = [DateTime]::UtcNow.AddSeconds(15)
+$created = $false
+while (-not $created -and [DateTime]::UtcNow -lt $deadline) {
+    Start-Sleep -Milliseconds 300
+    if (((& $Exe ls) -join "`n") -match "(?m)^kbsess$PID\s") { $created = $true }
+}
+Check $created "Ctrl+`` prompt creates the named session"
+Wait-RawQuiet $r 2500 30000  # let the new session's shell reach its prompt
+$mark = $r.Out.Length
+Send-Str "echo kbland-$PID`r"
+$deadline = [DateTime]::UtcNow.AddSeconds(10)
+$landed = $false
+while (-not $landed -and [DateTime]::UtcNow -lt $deadline -and -not $r.Closed) {
+    Pump-Raw $r 300
+    if ($r.Out.ToString().Substring($mark) -match "kbland-$PID") { $landed = $true }
+}
+Check $landed "client is attached and interactive after the silent switch"
+Wait-RawQuiet $r 1000 10000
 
 # Detach via the bare FS byte — exactly how Ctrl+\ / Ctrl+Shift+\ arrives
 # over SSH from any OS/terminal (VT carries no modifier info).
@@ -259,8 +314,21 @@ $psi.Arguments = "__pty 110 30 `"$Exe`" $iname"
 $ip2 = [System.Diagnostics.Process]::Start($psi)
 $rin2 = $ip2.StandardInput.BaseStream
 $r2 = New-RawReader $ip2.StandardOutput.BaseStream
-Check (Wait-Output $r2 'attached to' 10) "reattach via fx <name> works"
-Wait-RawQuiet $r2 1200 10000
+Wait-RawQuiet $r2 1500 15000
+Check ($r2.Out.Length -gt 200) "reattach via fx <name> works (replay received)"
+
+# `fx ls` inside a session must highlight the current session in green.
+$mark2 = $r2.Out.Length
+$lsCmd = [Text.Encoding]::UTF8.GetBytes("& '$Exe' ls`r")
+$rin2.Write($lsCmd, 0, $lsCmd.Length); $rin2.Flush()
+$deadline = [DateTime]::UtcNow.AddSeconds(10)
+$greenRow = $false
+while (-not $greenRow -and [DateTime]::UtcNow -lt $deadline -and -not $r2.Closed) {
+    Pump-Raw $r2 300
+    if ($r2.Out.ToString().Substring($mark2) -match "$([char]27)\[32m$iname") { $greenRow = $true }
+}
+Check $greenRow "fx ls highlights the current session in green"
+Wait-RawQuiet $r2 1000 8000
 # Replay must not re-ask terminal queries (the terminal's stale answers
 # would be typed into the shell, e.g. "27;3$y").
 Check (-not ($r2.Out.ToString() -cmatch '\$p|\$y')) "no terminal queries replayed on reattach"
@@ -277,6 +345,16 @@ Send-Frame $c3 2 ([byte[]]@(100, 0, 30, 0))
 [void](Pump $c3 1500)
 Check ($c3.Out.ToString() -match "sw-marker-$PID") "marker present in switched session's buffer"
 $c3.Pipe.Dispose()
+
+# The kbland marker must be in the prompt-created session's buffer, proving
+# the silent switch really landed there.
+$c5 = New-PipeClient "flux.$sid.kbsess$PID"
+Send-Frame $c5 2 ([byte[]]@(100, 0, 30, 0))
+[void](Pump $c5 1500)
+Check ($c5.Out.ToString() -match "kbland-$PID") "marker present in prompt-created session's buffer"
+$c5.Pipe.Dispose()
+
 & $Exe kill $swname | Out-Null
+& $Exe kill "kbsess$PID" | Out-Null
 
 if ($failed) { Write-Host "`nSMOKE: FAIL"; exit 1 } else { Write-Host "`nSMOKE: PASS"; exit 0 }

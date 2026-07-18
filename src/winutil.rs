@@ -335,5 +335,23 @@ pub fn valid_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 32
         && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// Sorted names of this user's live sessions (one pipe per session).
+pub fn list_sessions(sid: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let prefix = pipe_prefix(sid);
+    if let Ok(rd) = std::fs::read_dir(r"\\.\pipe\") {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if let Some(rest) = n.strip_prefix(&prefix) {
+                if valid_name(rest) {
+                    names.push(rest.to_string());
+                }
+            }
+        }
+    }
+    names.sort();
+    names
 }
