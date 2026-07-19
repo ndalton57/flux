@@ -1,7 +1,7 @@
 //! The attach side: puts this console into raw mode, forwards keyboard
 //! input to the server as plain text + standard VT sequences (exactly what
 //! sshd feeds a console, parsed by every conhost since Win10 1809), and
-//! pumps server output to the screen. Ctrl+\ detaches.
+//! pumps server output to the screen. Alt+\ detaches.
 
 use std::io;
 use std::mem::zeroed;
@@ -36,27 +36,29 @@ const CP_UTF8: u32 = 65001;
 const EV_KEY: u16 = 1;
 const EV_WINDOW_BUFFER_SIZE: u16 = 4;
 
-// Detach key constants (Ctrl+\): VK_OEM_5 is backslash on US layouts; the
-// FS control char catches every layout and every VT transport.
-const VK_OEM_5: u16 = 0xDC;
+// Keybinds live on Alt (since 1.1.3): Alt+X crosses every VT transport as
+// ESC then x — two plain bytes every terminal sends (kitty on macOS needs
+// macos_option_as_alt). Windows' conhost turns the pair, when it arrives
+// in one read, into a single Alt-flagged key record (verified empirically
+// with a record probe); human-speed Esc-then-key arrives as two plain
+// records, so vim's Esc habits forward untouched. Detection: Alt held,
+// Ctrl NOT held (AltGr reports Ctrl+Alt on intl layouts — excluded), char
+// match in uc; VK fallback only when uc is 0. Moving off Ctrl freed every
+// C0 code back to inner apps (Ctrl+\ 0x1C, Ctrl+O/P 0x0F/0x10, Ctrl+/
+// 0x1F, Ctrl+] 0x1D, Ctrl+6 0x1E all pass through again).
+const VK_OEM_5: u16 = 0xDC; // '\' key on US layouts — Alt+\ detaches
+const VK_OEM_COMMA: u16 = 0xBC; // ',' key — Alt+, cycles to previous
+const VK_OEM_PERIOD: u16 = 0xBE; // '.' key — Alt+. cycles to next
+const VK_OEM_2: u16 = 0xBF; // '/' key — Alt+/ opens the name prompt
 const SHIFT_PRESSED: u32 = 0x0010;
 const CTRL_PRESSED: u32 = 0x0008 | 0x0004; // left | right
 const ALT_PRESSED: u32 = 0x0001 | 0x0002; // right | left
-const FS_CHAR: u16 = 0x1C; // the control char Ctrl+\ produces
 
-// Session-cycling keys: Ctrl+] (next) survives every transport as the bare
-// GS control char. Ctrl+[ (previous) is byte-identical to Esc on VT
-// transports, so it is only recognized from full-fidelity local records.
-const VK_OEM_6: u16 = 0xDD; // ']' key on US layouts
-const VK_OEM_4: u16 = 0xDB; // '[' key on US layouts
-const GS_CHAR: u16 = 0x1D; // the control char Ctrl+] produces
-
-// New-session key: Ctrl+` / Ctrl+~ / Ctrl+^ / Ctrl+6 all collapse to the
-// RS control char under the ASCII ctrl-chord rule; Ctrl+6 is the spelling
-// every terminal transmits.
-const VK_OEM_3: u16 = 0xC0; // '`' key on US layouts
-const VK_6: u16 = 0x36;
-const RS_CHAR: u16 = 0x1E; // the control char those chords produce
+/// Alt held without Ctrl: the modifier shape shared by every flux chord.
+/// (Shift may ride along — layouts that type '/' etc. via Shift need it.)
+fn alt_no_ctrl(cs: u32) -> bool {
+    cs & ALT_PRESSED != 0 && cs & CTRL_PRESSED == 0
+}
 
 const CTRL_C_EVENT: u32 = 0;
 const CTRL_BREAK_EVENT: u32 = 1;
@@ -563,30 +565,34 @@ fn switch_to(target: &str) -> bool {
     true
 }
 
-/// Ctrl+] / Ctrl+[ hop to the neighboring session (sorted order, wrapping)
-/// without detaching — for when the current session is busy and can't take
-/// an `fx <name>` command. No-op with a single session. AltGr chords are
-/// excluded so layouts that type brackets via AltGr are unaffected.
+/// Alt+. / Alt+, hop to the next/previous session (sorted order,
+/// wrapping) without detaching — for when the current session is busy and
+/// can't take an `fx <name>` command. No-op with a single session.
+/// Swallowing these costs PSReadLine's Alt+. YankLastArg inside sessions
+/// (accepted by the user).
 fn cycle_direction(k: &KEY_EVENT_RECORD) -> Option<bool> {
+    if !alt_no_ctrl(k.dwControlKeyState) {
+        return None;
+    }
     let uc = unsafe { k.uChar.UnicodeChar };
-    let cs = k.dwControlKeyState;
-    let ctrl_only = cs & CTRL_PRESSED != 0 && cs & ALT_PRESSED == 0;
-    if uc == GS_CHAR || (ctrl_only && k.wVirtualKeyCode == VK_OEM_6) {
+    let vk = k.wVirtualKeyCode;
+    if uc == b'.' as u16 || (uc == 0 && vk == VK_OEM_PERIOD) {
         return Some(true);
     }
-    if ctrl_only && k.wVirtualKeyCode == VK_OEM_4 {
+    if uc == b',' as u16 || (uc == 0 && vk == VK_OEM_COMMA) {
         return Some(false);
     }
     None
 }
 
-/// Ctrl+` (or Ctrl+6 etc.) — create a fresh auto-named session and switch
-/// to it. The escape hatch when every existing session is busy or hung.
+/// Alt+/ — open the new-session prompt and switch to the result. The
+/// escape hatch when every existing session is busy or hung.
 fn is_new_session_key(k: &KEY_EVENT_RECORD) -> bool {
+    if !alt_no_ctrl(k.dwControlKeyState) {
+        return false;
+    }
     let uc = unsafe { k.uChar.UnicodeChar };
-    let cs = k.dwControlKeyState;
-    let ctrl_only = cs & CTRL_PRESSED != 0 && cs & ALT_PRESSED == 0;
-    uc == RS_CHAR || (ctrl_only && (k.wVirtualKeyCode == VK_OEM_3 || k.wVirtualKeyCode == VK_6))
+    uc == b'/' as u16 || (uc == 0 && k.wVirtualKeyCode == VK_OEM_2)
 }
 
 /// Draw (or update) the centered name-prompt dialog. `full` redraws the
@@ -648,7 +654,7 @@ fn draw_prompt(name: &str, full: bool) {
 }
 
 /// Modal key loop for the name prompt. Enter on a non-empty name confirms;
-/// Esc / Ctrl+C / Ctrl+` cancel; only session-name characters are accepted
+/// Esc / Ctrl+C / Ctrl+/ cancel; only session-name characters are accepted
 /// (no spaces, tabs, or newlines — same rules as `fx <name>`).
 fn run_name_prompt() -> Option<String> {
     let hin = std_handle(STD_INPUT_HANDLE);
@@ -702,7 +708,7 @@ fn run_name_prompt() -> Option<String> {
     }
 }
 
-/// Ctrl+`: full-screen prompt for a new session name, then create + switch.
+/// Ctrl+/: full-screen prompt for a new session name, then create + switch.
 /// Cancelling (or naming the current session) reconnects to the current
 /// session, which repaints the screen from the replay buffer.
 fn prompt_new_session() {
@@ -876,20 +882,15 @@ fn push_utf8(out: &mut Vec<u8>, c: char, repeat: usize) {
     }
 }
 
-/// Detach key: Ctrl+\ (Shift optional). Plain VT transports (ssh from any
-/// OS/terminal) encode Ctrl+\ and Ctrl+Shift+\ identically as the bare FS
-/// control char with no modifier info, so the char alone must trigger; the
-/// modifier+VK form additionally catches it on full-fidelity local input.
+/// Detach key: Alt+\. Arrives locally as an Alt-flagged record, and over
+/// ssh as ESC 0x5C — which conhost synthesizes into the same Alt-flagged
+/// record when the bytes share a read (see the keybind block comment).
 fn is_detach_chord(k: &KEY_EVENT_RECORD) -> bool {
-    if k.bKeyDown == 0 {
+    if k.bKeyDown == 0 || !alt_no_ctrl(k.dwControlKeyState) {
         return false;
     }
     let uc = unsafe { k.uChar.UnicodeChar };
-    if uc == FS_CHAR {
-        return true;
-    }
-    let cs = k.dwControlKeyState;
-    cs & CTRL_PRESSED != 0 && cs & SHIFT_PRESSED != 0 && k.wVirtualKeyCode == VK_OEM_5
+    uc == b'\\' as u16 || (uc == 0 && k.wVirtualKeyCode == VK_OEM_5)
 }
 
 fn input_loop(initial: (i16, i16)) -> i32 {

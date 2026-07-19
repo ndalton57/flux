@@ -28,6 +28,8 @@ Check ($LASTEXITCODE -eq 0) "session names may contain periods"
 # --- 2. it shows up in ls ---------------------------------------------------
 $ls = (& $Exe ls) -join "`n"
 Check ($ls -match [regex]::Escape($name)) "fx ls lists the session"
+# Bare fx lists sessions too (1.2.0: it no longer attaches 'main').
+Check (((& $Exe) -join "`n") -match [regex]::Escape($name)) "bare fx lists sessions"
 
 # --- 3. attach over the pipe, run a command, see its output -----------------
 $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -259,27 +261,68 @@ Wait-RawQuiet $r 2500 30000      # let the switched-to shell reach its prompt
 Send-Str "echo sw-marker-$PID`r"
 Check (Wait-Output $r "sw-marker-$PID" 10) "input lands in the switched-to session"
 
-# Cycle keys: Ctrl+] hops to a neighboring session, Ctrl+[ hops back.
-# Verified via the CLIENTS column: our one client leaves swtest (count 0)
-# and returns (count 1). Which neighbor it visits doesn't matter — the
-# user may have real sessions running.
+# Cycle keys: Alt+. hops to a neighboring session, Alt+, hops back. Over
+# ssh an Alt chord arrives as ESC + the char in one write; conhost turns
+# that into a single Alt-flagged record. Verified via the CLIENTS column:
+# our one client leaves swtest (count 0) and returns (count 1). Which
+# neighbor it visits doesn't matter — the user may have real sessions
+# running.
 Wait-RawQuiet $r 800 5000
-Send-Raw (, [byte]0x1D)
+Send-Raw ([byte[]]@(0x1B, 0x2E))     # Alt+. as ESC-prefix bytes — the ssh form
 $deadline = [DateTime]::UtcNow.AddSeconds(10)
 while ((Get-Clients $swname) -ne 0 -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 300 }
-Check ((Get-Clients $swname) -eq 0) "Ctrl+] (raw VT byte) cycles to the next session"
+Check ((Get-Clients $swname) -eq 0) "Alt+. (ESC-prefix bytes) cycles to the next session"
 Start-Sleep -Milliseconds 800
-Send-Str "$([char]27)[219;26;27;1;8;1_$([char]27)[219;26;27;0;8;1_"
+Send-Raw ([byte[]]@(0x1B, 0x2C))     # Alt+, as ESC-prefix bytes — the ssh form
 $deadline = [DateTime]::UtcNow.AddSeconds(10)
 while ((Get-Clients $swname) -ne 1 -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 300 }
-Check ((Get-Clients $swname) -eq 1) "Ctrl+[ (local chord) cycles back to the previous session"
+Check ((Get-Clients $swname) -eq 1) "Alt+, (ESC-prefix bytes) cycles back to the previous session"
+
+# vim safety: Esc followed by ',' at human speed must NOT cycle — the two
+# bytes arrive in separate reads, so conhost emits two plain records and
+# both forward to the session as keystrokes. ORDERING MATTERS: this must
+# run BEFORE any win32-input-mode sequence (ESC[..._) goes through this
+# conhost — seeing one permanently flips its parser into a regime where a
+# lone ESC latches forever and fuses with the next byte (win32-input
+# terminals never send bare ESC). The ssh path never carries win32
+# sequences, so the pure-VT regime is the faithful model. A real cycle
+# would move our client off swtest durably, so poll for a definitive 0;
+# single-shot reads would turn transient `fx ls` hiccups into false FAILs.
+Send-Raw (, [byte]0x1B)
+Start-Sleep -Milliseconds 400
+Send-Raw (, [byte]0x2C)
+$evac = $false
+$deadline = [DateTime]::UtcNow.AddSeconds(3)
+while ([DateTime]::UtcNow -lt $deadline) {
+    if ((Get-Clients $swname) -eq 0) { $evac = $true; break }
+    Start-Sleep -Milliseconds 250
+}
+Check (-not $evac) "Esc-then-comma (separate writes) does not cycle"
+Send-Raw (, [byte]3)         # Ctrl+C clears the ',' typed at the prompt
+Wait-RawQuiet $r 800 5000
+
+Start-Sleep -Milliseconds 800
+Send-Raw ([byte[]]@(0x1B, 0x2E))     # forward again...
+$deadline = [DateTime]::UtcNow.AddSeconds(10)
+while ((Get-Clients $swname) -ne 0 -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 300 }
+Start-Sleep -Milliseconds 800
+# Alt+, as a full-fidelity local record with uc=0 (vk 188 ',', LEFT_ALT) —
+# exercises the VK fallback branch, not the char match. NB: this is the
+# first win32-input-mode sequence through this conhost, and it flips the
+# conhost's lone-Esc heuristic for good — plain-VT Esc-timing tests must
+# stay ABOVE this line.
+Send-Str "$([char]27)[188;51;0;1;2;1_$([char]27)[188;51;0;0;2;1_"
+$deadline = [DateTime]::UtcNow.AddSeconds(10)
+while ((Get-Clients $swname) -ne 1 -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 300 }
+Check ((Get-Clients $swname) -eq 1) "Alt+, (local chord) cycles back to the previous session"
 Wait-RawQuiet $r 1500 15000
 
-# Ctrl+` (raw RS byte) opens the name prompt; a blank Enter is ignored,
-# then a typed name + Enter creates that session and switches to it
-# silently (no banner). Prove the switch by running a marker command that
-# must land in the NEW session's buffer (verified at the end via its pipe).
-Send-Raw (, [byte]0x1E)
+# Alt+/ (ESC-prefix bytes) opens the name prompt; a blank Enter is
+# ignored, then a typed name + Enter creates that session and switches to
+# it silently (no banner). Prove the switch by running a marker command
+# that must land in the NEW session's buffer (verified at the end via its
+# pipe).
+Send-Raw ([byte[]]@(0x1B, 0x2F))
 Send-Str "`r"                # blank entry must be ignored
 Send-Str "kbsess$PID`r"
 $deadline = [DateTime]::UtcNow.AddSeconds(15)
@@ -288,7 +331,7 @@ while (-not $created -and [DateTime]::UtcNow -lt $deadline) {
     Start-Sleep -Milliseconds 300
     if (((& $Exe ls) -join "`n") -match "(?m)^kbsess$PID\s") { $created = $true }
 }
-Check $created "Ctrl+`` prompt creates the named session"
+Check $created "Alt+/ prompt creates the named session"
 Wait-RawQuiet $r 2500 30000  # let the new session's shell reach its prompt
 $mark = $r.Out.Length
 Send-Str "echo kbland-$PID`r"
@@ -301,15 +344,23 @@ while (-not $landed -and [DateTime]::UtcNow -lt $deadline -and -not $r.Closed) {
 Check $landed "client is attached and interactive after the silent switch"
 Wait-RawQuiet $r 1000 10000
 
-# Detach via the bare FS byte — exactly how Ctrl+\ / Ctrl+Shift+\ arrives
-# over SSH from any OS/terminal (VT carries no modifier info).
+# Freed C0 byte: bare 0x1C (the old Ctrl+\ detach) must now pass through
+# to the session as a keystroke instead of detaching.
 Send-Raw (, [byte]0x1C)
-Check (Wait-Output $r 'detached' 8) "Ctrl+\ as raw VT byte detaches (ssh path)"
+Start-Sleep -Milliseconds 1500
+Check (-not $ip.HasExited) "bare 0x1C no longer detaches (freed back to apps)"
+Send-Raw (, [byte]3)         # clear the prompt line
+Wait-RawQuiet $r 800 5000
+
+# Detach via ESC+backslash — exactly how Alt+\ arrives over SSH from any
+# OS/terminal.
+Send-Raw ([byte[]]@(0x1B, 0x5C))
+Check (Wait-Output $r 'detached' 8) "Alt+\ (ESC-prefix bytes) detaches (ssh path)"
 Check ($ip.WaitForExit(8000)) "client process exited after detach"
 $ls = (& $Exe ls) -join "`n"
 Check ($ls -match [regex]::Escape($iname)) "session survives detach"
 
-# Reattach and detach via the full-fidelity Ctrl+Shift+\ chord (local path).
+# Reattach and detach via the full-fidelity Alt+\ chord (local path).
 $psi.Arguments = "__pty 110 30 `"$Exe`" $iname"
 $ip2 = [System.Diagnostics.Process]::Start($psi)
 $rin2 = $ip2.StandardInput.BaseStream
@@ -332,9 +383,9 @@ Wait-RawQuiet $r2 1000 8000
 # Replay must not re-ask terminal queries (the terminal's stale answers
 # would be typed into the shell, e.g. "27;3$y").
 Check (-not ($r2.Out.ToString() -cmatch '\$p|\$y')) "no terminal queries replayed on reattach"
-$chord = [Text.Encoding]::UTF8.GetBytes("$([char]27)[220;43;28;1;24;1_$([char]27)[220;43;28;0;24;1_")
+$chord = [Text.Encoding]::UTF8.GetBytes("$([char]27)[220;43;92;1;2;1_$([char]27)[220;43;92;0;2;1_")
 $rin2.Write($chord, 0, $chord.Length); $rin2.Flush()
-Check (Wait-Output $r2 'detached' 8) "Ctrl+Shift+\ chord detaches (local path)"
+Check (Wait-Output $r2 'detached' 8) "Alt+\ chord detaches (local path)"
 [void]$ip2.WaitForExit(8000)
 & $Exe kill $iname | Out-Null
 

@@ -17,7 +17,7 @@ fn main() {
     let arg = |i: usize| args.get(i).map(String::as_str);
 
     let code = match arg(0) {
-        None => client::attach(DEFAULT_SESSION, true, None),
+        None => cmd_ls(),
         Some("__server") => {
             // Hidden: fx __server <name> <cols> <rows> [shell cmdline]
             let name = arg(1).unwrap_or(DEFAULT_SESSION).to_string();
@@ -297,7 +297,7 @@ fn query_info(name: &str) -> Option<(String, String, String)> {
 fn cmd_ls() -> i32 {
     let names = list_session_names();
     if names.is_empty() {
-        println!("no sessions");
+        println!("no sessions (start one with: fx <name>)");
         return 0;
     }
     // Highlight the session we're inside (running `fx ls` in a session means
@@ -379,12 +379,12 @@ const HELP: &str = "\
 flux — persistent shell sessions for Windows
 
 usage:
-  fx [name]           attach to session 'name', creating it if needed
-                      (default session: 'main')
+  fx                  list your sessions; current one green
+  fx <name>           attach to session 'name', creating it if needed
   fx <name> -d        start a session without attaching
   fx <name> -- <cmd>  run <cmd> in the session instead of the default shell
   fx attach [name]    attach only; fail if it doesn't exist   (alias: a)
-  fx list             list your sessions; current one green   (alias: ls)
+  fx list             list sessions (same as bare fx)         (alias: ls)
   fx detach [name]    detach all attached clients             (alias: d)
   fx kill [name]      end a session (terminates its shell)
   fx autostart        start 'main' at every boot, non-elevated
@@ -397,12 +397,11 @@ session in place (creating it if needed) — no nesting. For detach/kill,
 'name' defaults to the current session (FLUX_SESSION).
 
 keys:
-  Ctrl+\\              detach from the current session
-  Ctrl+]              cycle to the next session
-  Ctrl+[              cycle to the previous session (local input; over ssh
-                      it is identical to Esc — use Ctrl+] to wrap around)
-  Ctrl+~              open the new-session prompt
-                      (Ctrl+6 works from every terminal)
+  Alt+\\               detach from the current session
+  Alt+.               cycle to the next session
+  Alt+,               cycle to the previous session
+  Alt+/               open the new-session prompt
+                      (macOS kitty: set macos_option_as_alt yes)
 
 environment:
   FLUX_SHELL          default shell command line for new sessions
